@@ -11,6 +11,7 @@ import Footer from "../components/Footer";
 
 export default function ContactPage() {
   const [fullName, setFullName] = useState("");
+   const[email, setEmail] = useState("");
   const [subject, setSubject] = useState("");
   const [message, setMessage] = useState("");
 
@@ -65,6 +66,24 @@ export default function ContactPage() {
           />
         </div>
 
+          {/* Email Field */}
+        <div>
+          <label
+            htmlFor="fullName"
+            className="block text-white/ text-sm font-light mb-3"
+          >
+            Email
+          </label>
+          <input
+            type="email"
+            id="email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            placeholder="Enter Email"
+            className="w-full px-4 py-3.5 bg-white/5 border border-white/10 rounded-lg text-white placeholder:text-white/30 focus:outline-none focus:border-cyan-400/50 focus:bg-white/[0.07] transition-all text-sm font-light"
+          />
+        </div>
+
         {/* Subject Field */}
         <div>
           <label
@@ -85,7 +104,7 @@ export default function ContactPage() {
                 Technical Support
               </option>
               <option value="account">Account Issues</option>
-              <option value="billing">Billing Questions</option>
+              <option value="inheritance">Inheritance Questions</option>
               <option value="general">General Inquiry</option>
             </select>
             <ChevronDown className="absolute right-4 top-1/2 -translate-y-1/2 w-5 h-5 text-white/30 pointer-events-none" />
