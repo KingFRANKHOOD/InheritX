@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     routing::{get, post},
     Json, Router,
 };
@@ -15,6 +15,7 @@ use crate::analytics::analytics_router;
 use crate::api_error::ApiError;
 use crate::auth::{AuthenticatedAdmin, AuthenticatedUser};
 use crate::config::Config;
+use crate::loan_lifecycle::{CreateLoanRequest, LoanLifecycleService, LoanListFilters};
 use crate::service::{
     ClaimPlanRequest, CreatePlanRequest, KycRecord, KycService, KycStatus, LoanSimulationRequest,
     LoanSimulationService, PlanService,
@@ -69,6 +70,20 @@ pub async fn create_app(db: PgPool, config: Config) -> Result<Router, ApiError> 
         .route("/api/loans/simulate", post(simulate_loan))
         .route("/api/loans/simulations", get(get_user_simulations))
         .route("/api/loans/simulations/:simulation_id", get(get_simulation))
+        // ── Loan Lifecycle Tracker ─────────────────────────────────────────────
+        .route("/api/loans/lifecycle", post(create_lifecycle_loan))
+        .route("/api/loans/lifecycle", get(list_lifecycle_loans))
+        .route("/api/loans/lifecycle/summary", get(get_lifecycle_summary))
+        .route("/api/loans/lifecycle/:id", get(get_lifecycle_loan))
+        .route("/api/loans/lifecycle/:id/repay", post(repay_lifecycle_loan))
+        .route(
+            "/api/admin/loans/lifecycle/:id/liquidate",
+            post(liquidate_lifecycle_loan),
+        )
+        .route(
+            "/api/admin/loans/lifecycle/mark-overdue",
+            post(mark_overdue_loans),
+        )
         .route(
             "/api/admin/plans/due-for-claim",
             get(get_all_due_for_claim_plans_admin),
@@ -275,4 +290,111 @@ async fn get_simulation(
             simulation_id
         ))),
     }
+}
+
+// =============================================================================
+// Loan Lifecycle Endpoints
+// =============================================================================
+
+/// Open a new loan in the `active` state.
+///
+/// `POST /api/loans/lifecycle`
+async fn create_lifecycle_loan(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedUser(user): AuthenticatedUser,
+    Json(mut req): Json<CreateLoanRequest>,
+) -> Result<Json<Value>, ApiError> {
+    // Override user_id from the authenticated token to prevent impersonation.
+    req.user_id = user.user_id;
+    let record = LoanLifecycleService::create_loan(&state.db, &req).await?;
+    Ok(Json(json!({ "status": "success", "data": record })))
+}
+
+/// List loans, optionally filtered by status.
+///
+/// `GET /api/loans/lifecycle[?status=active|repaid|overdue|liquidated]`
+async fn list_lifecycle_loans(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedUser(user): AuthenticatedUser,
+    Query(mut filters): Query<LoanListFilters>,
+) -> Result<Json<Value>, ApiError> {
+    // Users may only see their own loans.
+    filters.user_id = Some(user.user_id);
+    let loans = LoanLifecycleService::list_loans(&state.db, &filters).await?;
+    Ok(Json(json!({
+        "status": "success",
+        "data": loans,
+        "count": loans.len()
+    })))
+}
+
+/// Aggregate counts by lifecycle status for the authenticated user.
+///
+/// `GET /api/loans/lifecycle/summary`
+async fn get_lifecycle_summary(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedUser(user): AuthenticatedUser,
+) -> Result<Json<Value>, ApiError> {
+    let summary =
+        LoanLifecycleService::get_lifecycle_summary(&state.db, Some(user.user_id)).await?;
+    Ok(Json(json!({ "status": "success", "data": summary })))
+}
+
+/// Fetch a single loan by its UUID.
+///
+/// `GET /api/loans/lifecycle/:id`
+async fn get_lifecycle_loan(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    AuthenticatedUser(_user): AuthenticatedUser,
+) -> Result<Json<Value>, ApiError> {
+    let record = LoanLifecycleService::get_loan(&state.db, id).await?;
+    Ok(Json(json!({ "status": "success", "data": record })))
+}
+
+/// Apply a repayment to a loan.  When cumulative repayments reach or exceed
+/// the principal the loan transitions to `repaid`.
+///
+/// `POST /api/loans/lifecycle/:id/repay`
+#[derive(serde::Deserialize)]
+struct RepayRequest {
+    amount: rust_decimal::Decimal,
+}
+
+async fn repay_lifecycle_loan(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    AuthenticatedUser(user): AuthenticatedUser,
+    Json(req): Json<RepayRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let record = LoanLifecycleService::repay_loan(&state.db, id, user.user_id, req.amount).await?;
+    Ok(Json(json!({ "status": "success", "data": record })))
+}
+
+/// Admin: forcefully liquidate a loan.
+///
+/// `POST /api/admin/loans/lifecycle/:id/liquidate`
+async fn liquidate_lifecycle_loan(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    AuthenticatedAdmin(admin): AuthenticatedAdmin,
+) -> Result<Json<Value>, ApiError> {
+    let record = LoanLifecycleService::liquidate_loan(&state.db, id, admin.admin_id).await?;
+    Ok(Json(json!({ "status": "success", "data": record })))
+}
+
+/// Admin: sweep all active loans whose due_date has passed and mark them
+/// `overdue`.  Designed to be triggered by a cron / background job.
+///
+/// `POST /api/admin/loans/lifecycle/mark-overdue`
+async fn mark_overdue_loans(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedAdmin(_admin): AuthenticatedAdmin,
+) -> Result<Json<Value>, ApiError> {
+    let marked_ids = LoanLifecycleService::mark_overdue_loans(&state.db).await?;
+    Ok(Json(json!({
+        "status": "success",
+        "marked_overdue": marked_ids.len(),
+        "loan_ids": marked_ids
+    })))
 }
