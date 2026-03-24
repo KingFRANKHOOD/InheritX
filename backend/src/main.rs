@@ -45,6 +45,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
     interest_reconciliation.start();
 
+    // Initialize Lending Notification Service
+    let lending_notification_service = std::sync::Arc::new(
+        inheritx_backend::LendingNotificationService::new(db_pool.clone()),
+    );
+    lending_notification_service.start();
+
     // Start server
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
     info!("Starting INHERITX backend server on {}", addr);
