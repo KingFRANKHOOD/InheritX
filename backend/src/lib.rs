@@ -12,6 +12,7 @@ pub mod middleware;
 pub mod notifications;
 pub mod price_feed;
 pub mod price_feed_handlers;
+pub mod reputation;
 pub mod risk_engine;
 pub mod safe_math;
 pub mod service;
