@@ -19,14 +19,20 @@ use crate::service::{
     ClaimPlanRequest, CreatePlanRequest, KycRecord, KycService, KycStatus, LoanSimulationRequest,
     LoanSimulationService, PlanService,
 };
+use crate::yield_service::{DefaultOnChainYieldService, OnChainYieldService};
 
 pub struct AppState {
     pub db: PgPool,
     pub config: Config,
+    pub yield_service: Arc<dyn OnChainYieldService>,
 }
 
 pub async fn create_app(db: PgPool, config: Config) -> Result<Router, ApiError> {
-    let state = Arc::new(AppState { db, config });
+    let state = Arc::new(AppState {
+        db,
+        config,
+        yield_service: Arc::new(DefaultOnChainYieldService::new()),
+    });
 
     // Rate limiting configuration
     let governor_conf = Arc::new(

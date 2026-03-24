@@ -14,9 +14,12 @@ use crate::api_error::ApiError;
 use crate::notifications::{
     audit_action, entity_type, notif_type, AuditLogService, NotificationService,
 };
+use crate::yield_service::OnChainYieldService;
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, QueryBuilder};
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
 use uuid::Uuid;
@@ -1395,6 +1398,322 @@ impl LendingMonitoringService {
             total_borrowed: current_debt,
             utilization_rate,
             active_loans_count: row.active_loans_count,
+        })
+    }
+}
+
+// ── Yield Reporting ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct YieldReportFilters {
+    pub asset_code: Option<String>,
+    pub user_id: Option<Uuid>,
+    pub plan_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct YieldVaultSummary {
+    pub asset_code: String,
+    pub realized_yield: f64,
+    pub on_chain_yield: Option<f64>,
+    pub apy: f64,
+    pub total_principal_balance: f64,
+    pub accrual_event_count: i64,
+    pub last_accrual_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct YieldSummaryResponse {
+    pub filters: YieldReportFilters,
+    pub total_realized_yield: f64,
+    pub total_on_chain_yield: Option<f64>,
+    pub average_apy: f64,
+    pub vaults: Vec<YieldVaultSummary>,
+    pub generated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EarningsHistoryPoint {
+    pub period: String,
+    pub asset_code: String,
+    pub earnings: f64,
+    pub event_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EarningsHistoryResponse {
+    pub filters: YieldReportFilters,
+    pub range: String,
+    pub total_earnings: f64,
+    pub history: Vec<EarningsHistoryPoint>,
+}
+
+#[derive(sqlx::FromRow)]
+struct YieldAccrualEventRow {
+    asset_code: String,
+    user_id: Uuid,
+    plan_id: Option<Uuid>,
+    amount: String,
+    metadata: serde_json::Value,
+    event_timestamp: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct EarningsHistoryRow {
+    period: String,
+    asset_code: String,
+    earnings: f64,
+    event_count: i64,
+}
+
+#[derive(Default)]
+struct YieldVaultAccumulator {
+    total_realized_yield: Decimal,
+    total_principal_balance: Decimal,
+    weighted_rate_numerator: Decimal,
+    accrual_event_count: i64,
+    last_accrual_at: Option<DateTime<Utc>>,
+    seen_positions: HashSet<String>,
+}
+
+pub struct YieldReportingService;
+
+impl YieldReportingService {
+    pub async fn get_yield_summary(
+        db: &PgPool,
+        filters: YieldReportFilters,
+        yield_service: &dyn OnChainYieldService,
+    ) -> Result<YieldSummaryResponse, ApiError> {
+        let events = Self::get_interest_accrual_events(db, &filters).await?;
+        let is_asset_pool_scope = filters.user_id.is_none() && filters.plan_id.is_none();
+        let mut vaults: BTreeMap<String, YieldVaultAccumulator> = BTreeMap::new();
+
+        for event in events {
+            let amount = Self::parse_decimal(&event.amount, "accrual amount")?;
+            let asset_code = event.asset_code.to_uppercase();
+            let position_key = event
+                .plan_id
+                .map(|plan_id| format!("plan:{plan_id}"))
+                .unwrap_or_else(|| format!("user:{}", event.user_id));
+
+            let accumulator = vaults.entry(asset_code).or_default();
+            accumulator.total_realized_yield += amount;
+            accumulator.accrual_event_count += 1;
+            accumulator.last_accrual_at = match accumulator.last_accrual_at {
+                Some(last_seen) if last_seen >= event.event_timestamp => Some(last_seen),
+                _ => Some(event.event_timestamp),
+            };
+
+            if accumulator.seen_positions.insert(position_key) {
+                if let Some(principal_balance) =
+                    Self::decimal_from_metadata(&event.metadata, "principal_balance")
+                {
+                    if principal_balance > Decimal::ZERO {
+                        let normalized_rate = Self::normalize_rate(
+                            Self::decimal_from_metadata(&event.metadata, "interest_rate")
+                                .unwrap_or(Decimal::ZERO),
+                        );
+
+                        accumulator.total_principal_balance += principal_balance;
+                        accumulator.weighted_rate_numerator += normalized_rate * principal_balance;
+                    }
+                }
+            }
+        }
+
+        let mut total_realized_yield = 0.0;
+        let mut total_on_chain_yield = 0.0;
+        let mut any_on_chain_yield = false;
+        let mut aggregate_principal_balance = Decimal::ZERO;
+        let mut aggregate_weighted_rate_numerator = Decimal::ZERO;
+        let mut summaries = Vec::with_capacity(vaults.len());
+
+        for (asset_code, accumulator) in vaults {
+            let apy = if accumulator.total_principal_balance > Decimal::ZERO {
+                Self::annual_rate_to_apy(
+                    accumulator.weighted_rate_numerator / accumulator.total_principal_balance,
+                )
+            } else {
+                0.0
+            };
+
+            let realized_yield = Self::decimal_to_f64(accumulator.total_realized_yield)?;
+            total_realized_yield += realized_yield;
+            aggregate_principal_balance += accumulator.total_principal_balance;
+            aggregate_weighted_rate_numerator += accumulator.weighted_rate_numerator;
+
+            let on_chain_yield = if is_asset_pool_scope {
+                let yield_amount = yield_service
+                    .get_total_on_chain_yield_amount(&asset_code)
+                    .await?;
+                let value = Self::decimal_to_f64(yield_amount)?;
+                total_on_chain_yield += value;
+                any_on_chain_yield = true;
+                Some(value)
+            } else {
+                None
+            };
+
+            summaries.push(YieldVaultSummary {
+                asset_code,
+                realized_yield,
+                on_chain_yield,
+                apy,
+                total_principal_balance: Self::decimal_to_f64(accumulator.total_principal_balance)?,
+                accrual_event_count: accumulator.accrual_event_count,
+                last_accrual_at: accumulator.last_accrual_at,
+            });
+        }
+
+        let average_apy = if aggregate_principal_balance > Decimal::ZERO {
+            Self::annual_rate_to_apy(
+                aggregate_weighted_rate_numerator / aggregate_principal_balance,
+            )
+        } else {
+            0.0
+        };
+
+        Ok(YieldSummaryResponse {
+            filters,
+            total_realized_yield,
+            total_on_chain_yield: any_on_chain_yield.then_some(total_on_chain_yield),
+            average_apy,
+            vaults: summaries,
+            generated_at: Utc::now(),
+        })
+    }
+
+    pub async fn get_earnings_history(
+        db: &PgPool,
+        filters: YieldReportFilters,
+        range: &str,
+    ) -> Result<EarningsHistoryResponse, ApiError> {
+        let (interval, trunc) = match range {
+            "daily" => ("30 days", "day"),
+            "weekly" => ("12 weeks", "week"),
+            "monthly" => ("12 months", "month"),
+            _ => {
+                return Err(ApiError::BadRequest(
+                    "Invalid range. Use daily, weekly, or monthly.".to_string(),
+                ))
+            }
+        };
+
+        let mut query = QueryBuilder::<Postgres>::new("SELECT DATE_TRUNC('");
+        query.push(trunc);
+        query.push("', event_timestamp)::DATE::TEXT AS period,");
+        query.push(" asset_code, COALESCE(SUM(CAST(amount AS NUMERIC)), 0)::FLOAT8 AS earnings,");
+        query.push(" COUNT(*)::BIGINT AS event_count FROM lending_events WHERE event_type = '");
+        query.push("interest_accrual");
+        query.push("' AND event_timestamp >= NOW() - INTERVAL '");
+        query.push(interval);
+        query.push("'");
+
+        Self::push_yield_filters(&mut query, &filters);
+
+        query.push(" GROUP BY 1, 2 ORDER BY 1 ASC, 2 ASC");
+
+        let rows = query
+            .build_query_as::<EarningsHistoryRow>()
+            .fetch_all(db)
+            .await?;
+
+        let history: Vec<EarningsHistoryPoint> = rows
+            .into_iter()
+            .map(|row| EarningsHistoryPoint {
+                period: row.period,
+                asset_code: row.asset_code,
+                earnings: row.earnings,
+                event_count: row.event_count,
+            })
+            .collect();
+
+        let total_earnings = history.iter().map(|point| point.earnings).sum();
+
+        Ok(EarningsHistoryResponse {
+            filters,
+            range: range.to_string(),
+            total_earnings,
+            history,
+        })
+    }
+
+    async fn get_interest_accrual_events(
+        db: &PgPool,
+        filters: &YieldReportFilters,
+    ) -> Result<Vec<YieldAccrualEventRow>, ApiError> {
+        let mut query = QueryBuilder::<Postgres>::new(
+            "SELECT asset_code, user_id, plan_id, amount, metadata, event_timestamp FROM lending_events WHERE event_type = '",
+        );
+        query.push("interest_accrual");
+        query.push("'");
+        Self::push_yield_filters(&mut query, filters);
+        query.push(" ORDER BY asset_code ASC, event_timestamp DESC");
+
+        Ok(query
+            .build_query_as::<YieldAccrualEventRow>()
+            .fetch_all(db)
+            .await?)
+    }
+
+    fn push_yield_filters(query: &mut QueryBuilder<'_, Postgres>, filters: &YieldReportFilters) {
+        if let Some(asset_code) = &filters.asset_code {
+            query.push(" AND UPPER(asset_code) = ");
+            query.push_bind(asset_code.to_uppercase());
+        }
+
+        if let Some(user_id) = filters.user_id {
+            query.push(" AND user_id = ");
+            query.push_bind(user_id);
+        }
+
+        if let Some(plan_id) = filters.plan_id {
+            query.push(" AND plan_id = ");
+            query.push_bind(plan_id);
+        }
+    }
+
+    fn parse_decimal(value: &str, field_name: &str) -> Result<Decimal, ApiError> {
+        Decimal::from_str(value).map_err(|error| {
+            ApiError::Internal(anyhow::anyhow!(
+                "Failed to parse {field_name} from yield reporting query: {error}"
+            ))
+        })
+    }
+
+    fn decimal_from_metadata(metadata: &serde_json::Value, key: &str) -> Option<Decimal> {
+        let value = metadata.get(key)?;
+        match value {
+            serde_json::Value::String(raw) => Decimal::from_str(raw).ok(),
+            serde_json::Value::Number(number) => Decimal::from_str(&number.to_string()).ok(),
+            _ => None,
+        }
+    }
+
+    fn normalize_rate(rate: Decimal) -> Decimal {
+        if rate > Decimal::ONE {
+            rate / Decimal::new(100, 0)
+        } else {
+            rate
+        }
+    }
+
+    fn annual_rate_to_apy(rate: Decimal) -> f64 {
+        let normalized_rate = Self::normalize_rate(rate);
+        let rate_f64 = normalized_rate.to_string().parse::<f64>().unwrap_or(0.0);
+        ((1.0 + (rate_f64 / 365.0)).powf(365.0) - 1.0) * 100.0
+    }
+
+    fn decimal_to_f64(value: Decimal) -> Result<f64, ApiError> {
+        value.to_string().parse::<f64>().map_err(|error| {
+            ApiError::Internal(anyhow::anyhow!(
+                "Failed to convert decimal to f64 for yield reporting: {error}"
+            ))
         })
     }
 }

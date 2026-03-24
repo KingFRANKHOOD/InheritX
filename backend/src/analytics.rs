@@ -3,7 +3,7 @@ use crate::app::AppState;
 use crate::auth::AuthenticatedAdmin;
 use crate::service::{
     AdminService, ClaimMetricsService, LendingMonitoringService, PlanStatisticsService,
-    RevenueMetricsService, UserMetricsService,
+    RevenueMetricsService, UserMetricsService, YieldReportFilters, YieldReportingService,
 };
 use axum::{
     extract::{Query, State},
@@ -13,6 +13,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
+use uuid::Uuid;
 
 #[derive(Deserialize)]
 pub struct RevenueRangeQuery {
@@ -20,8 +21,52 @@ pub struct RevenueRangeQuery {
     pub range: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct YieldSummaryQuery {
+    pub asset_code: Option<String>,
+    pub user_id: Option<String>,
+    pub plan_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct YieldHistoryQuery {
+    #[serde(default = "default_range")]
+    pub range: String,
+    pub asset_code: Option<String>,
+    pub user_id: Option<String>,
+    pub plan_id: Option<String>,
+}
+
 fn default_range() -> String {
     "monthly".to_string()
+}
+
+fn parse_uuid_filter(
+    raw_value: Option<String>,
+    field_name: &str,
+) -> Result<Option<Uuid>, ApiError> {
+    raw_value
+        .map(|value| {
+            Uuid::parse_str(value.trim())
+                .map_err(|error| ApiError::BadRequest(format!("Invalid {field_name}: {error}")))
+        })
+        .transpose()
+}
+
+fn build_yield_filters(
+    asset_code: Option<String>,
+    user_id: Option<String>,
+    plan_id: Option<String>,
+) -> Result<YieldReportFilters, ApiError> {
+    Ok(YieldReportFilters {
+        asset_code: asset_code
+            .map(|value| value.trim().to_uppercase())
+            .filter(|value| !value.is_empty()),
+        user_id: parse_uuid_filter(user_id, "userId")?,
+        plan_id: parse_uuid_filter(plan_id, "planId")?,
+    })
 }
 
 /// GET /api/admin/analytics/overview
@@ -109,6 +154,41 @@ async fn get_lending_metrics(
     })))
 }
 
+/// GET /api/admin/analytics/yield
+/// Returns vault yield and APY aggregated by asset-level vault.
+async fn get_yield_summary(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedAdmin(_admin): AuthenticatedAdmin,
+    Query(params): Query<YieldSummaryQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let filters = build_yield_filters(params.asset_code, params.user_id, params.plan_id)?;
+    let summary =
+        YieldReportingService::get_yield_summary(&state.db, filters, state.yield_service.as_ref())
+            .await?;
+
+    Ok(Json(json!({
+        "status": "success",
+        "data": summary
+    })))
+}
+
+/// GET /api/admin/analytics/yield/history?range=daily|weekly|monthly
+/// Returns earnings history from realized interest accruals.
+async fn get_earnings_history(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedAdmin(_admin): AuthenticatedAdmin,
+    Query(params): Query<YieldHistoryQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let filters = build_yield_filters(params.asset_code, params.user_id, params.plan_id)?;
+    let history =
+        YieldReportingService::get_earnings_history(&state.db, filters, &params.range).await?;
+
+    Ok(Json(json!({
+        "status": "success",
+        "data": history
+    })))
+}
+
 /// Aggregated dashboard endpoint — all metrics in one request.
 /// GET /api/admin/analytics/dashboard
 async fn get_dashboard(
@@ -150,4 +230,9 @@ pub fn analytics_router() -> Router<Arc<AppState>> {
         .route("/api/admin/analytics/claims", get(get_claim_metrics))
         .route("/api/admin/analytics/revenue", get(get_revenue_metrics))
         .route("/api/admin/analytics/lending", get(get_lending_metrics))
+        .route("/api/admin/analytics/yield", get(get_yield_summary))
+        .route(
+            "/api/admin/analytics/yield/history",
+            get(get_earnings_history),
+        )
 }
