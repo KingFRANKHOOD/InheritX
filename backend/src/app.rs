@@ -54,12 +54,12 @@ pub async fn create_app(db: PgPool, config: Config) -> Result<Router, ApiError> 
 
     let stress_testing_engine = Arc::new(StressTestingEngine::new(
         db.clone(),
-        price_feed,
+        price_feed.clone(),
         risk_engine,
     ));
 
     let state = Arc::new(AppState {
-        db,
+        db: db.clone(),
         config,
         yield_service,
         stress_testing_engine,
@@ -199,7 +199,47 @@ pub async fn create_app(db: PgPool, config: Config) -> Result<Router, ApiError> 
         .merge(analytics_router())
         .with_state(state);
 
-    Ok(app)
+    // Add price feed routes with separate state
+    let price_feed_state = (
+        db,
+        price_feed as Arc<dyn crate::price_feed::PriceFeedService>,
+    );
+    let price_routes = Router::new()
+        .route(
+            "/api/prices/:asset_code",
+            get(crate::price_feed_handlers::get_price),
+        )
+        .route(
+            "/api/prices/:asset_code/history",
+            get(crate::price_feed_handlers::get_price_history),
+        )
+        .route(
+            "/api/prices/:asset_code/valuation/:amount",
+            get(crate::price_feed_handlers::calculate_valuation),
+        )
+        .route(
+            "/api/plans/:plan_id/valuation",
+            get(crate::price_feed_handlers::get_plan_valuation),
+        )
+        .route(
+            "/api/admin/prices/register",
+            post(crate::price_feed_handlers::register_price_feed),
+        )
+        .route(
+            "/api/admin/prices/:asset_code/update",
+            post(crate::price_feed_handlers::update_price),
+        )
+        .route(
+            "/api/admin/prices/:asset_code/fetch",
+            post(crate::price_feed_handlers::fetch_and_update_price),
+        )
+        .route(
+            "/api/admin/prices/feeds",
+            get(crate::price_feed_handlers::get_active_feeds),
+        )
+        .with_state(price_feed_state);
+
+    Ok(app.merge(price_routes))
 }
 
 async fn health_check() -> Json<Value> {

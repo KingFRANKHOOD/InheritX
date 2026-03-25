@@ -9,6 +9,7 @@ pub mod emergency_access;
 pub mod emergency_access_jobs;
 pub mod event_handlers;
 pub mod events;
+pub mod external_price_fetcher;
 pub mod interest_reconciliation;
 pub mod lending_notification_service;
 pub mod loan_lifecycle;
